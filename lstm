@@ -1,0 +1,309 @@
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, TensorDataset
+import datetime
+import gc
+
+print(torch.__version__)
+
+torch.manual_seed(1)
+
+
+data_splite = []  #####list and data input
+
+
+max_data = max(data_splite)
+min_data = min(data_splite)
+scale    = max_data - min_data
+
+data_norm = []
+for i in range(len(data_splite)):
+    data_norm.append((data_splite[i]-min_data)/scale)
+
+
+#数据集整理
+def trans(data, num):
+
+    Data = []
+    for i in range(len(data)-num):
+        med = []
+        for j in range(num):
+            med.append(data[i+j])
+        Data.append(med)
+    return Data
+
+
+input_size = 1
+
+all_size = 21 + input_size
+
+Data = trans(data_norm, all_size)
+fea = []
+target = []
+train_target = []
+test_target = []
+train_len = int(0.8*len(Data))
+
+for i in range(len(Data)):
+    fea.append(Data[i][0:input_size])
+    target.append(Data[i][input_size:])
+train_target = target[:train_len]
+test_target = target[train_len:]
+
+train_fea = fea[:train_len]
+test_fea = fea[train_len:]
+
+test_len = len(Data) - train_len
+
+
+def mape(y_true, y_pred):
+    return np.mean(np.abs((y_pred - y_true) / y_true)) * 100
+
+
+def mae(y_ture, y_pred):
+    return np.mean(np.abs(y_ture - y_pred))
+
+
+def rmse(y_ture, y_pred):
+    err_all = []
+    for i in range(len(y_ture)):
+        error = y_ture[i] - y_pred[i]
+        err_all.append(np.power(error, 2))
+    return np.sqrt(np.mean(err_all))
+
+
+def duplicate_list(data, num):
+    data_duplicate = []
+    for i in range(num):
+        data_duplicate.append(data)
+
+    return data_duplicate
+
+
+hidden = 50
+number_layer = 5
+learning_rate = 1e-3
+epoches = 500
+
+train_data = TensorDataset(torch.Tensor(train_fea), torch.Tensor(train_target))
+test_data = TensorDataset(torch.Tensor(test_fea), torch.Tensor(test_target))
+
+train_batch = DataLoader(train_data, batch_size=16)
+test_batch = DataLoader(test_data, batch_size=16)
+
+
+# 设置网络
+class LSTM(nn.Module):
+    def __init__(self):
+        super(LSTM, self).__init__()
+
+        self.lstm = nn.LSTM(input_size=input_size, hidden_size=hidden, batch_first=True, bidirectional=False, bias=True,
+                            num_layers=number_layer)
+        self.linear = nn.Linear(in_features=hidden, out_features=21, bias=True)
+
+    def forward(self, x):
+        lstm_1, (h_n, h_c) = self.lstm(x)
+        result = self.linear(lstm_1)
+
+        return result
+
+
+lstm = LSTM().cuda()
+optimizer = torch.optim.Adam(lstm.parameters(), lr=learning_rate, weight_decay=0)
+loss_func = nn.MSELoss()
+
+date_1 = datetime.datetime.now()
+# 初始化误差
+train_loss = []
+train_loss_real = []
+test_loss = []
+test_loss_real = []
+min_test_loss = np.inf
+test_pred = []
+
+for epoch in range(epoches):
+    print('正在进行第{}个epoch'.format(epoch+1))
+    total_train_loss = []
+    test_pred_case = []
+    train_pred_real = []
+    test_pred_real = []
+    train_tar_real = []
+    test_tar_real = []
+    train_loss_real_case = []
+    test_loss_real_case = []
+
+    for step, data in enumerate(train_batch):
+        train_input, train_label = data
+        train_input = train_input.cuda()
+        train_label = train_label.cuda()
+        out = lstm(train_input)
+        loss = loss_func(out * scale + min_data, train_label * scale + min_data)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        out = out.cpu().detach().numpy()
+        train_pred_real.append(out)
+        total_train_loss.append(loss.item())
+    train_loss.append(np.mean(total_train_loss))
+
+    total_test_loss = []
+    for step, data in enumerate(test_batch):
+        test_input, test_label = data
+        test_input = test_input.cuda()
+        test_label = test_label.cuda()
+        out = lstm(test_input)
+        loss = loss_func(out * scale + min_data, test_label * scale + min_data)
+        total_test_loss.append(loss.item())
+        test_pred_case.append(out)
+
+    test_loss.append(np.mean(total_test_loss))
+    test_pred.append(test_pred_case)
+
+    if (test_loss[-1] < min_test_loss):
+
+        min_test_loss = test_loss[-1]
+        best_result = []
+        best_pred = test_pred[-1]
+        best_result.append([np.sqrt(train_loss[-1]), np.sqrt(test_loss[-1])])
+
+        # 编写日志
+    lr = optimizer.param_groups[0]['lr']
+
+    log_string = ('iter: [{:d}/{:d}],'
+                  'best_test_loss: {:0.8f},lr: {:0.9f},  '
+                  'train_mse: {:0.8f}, test_mse: {:0.8f}, '
+                  'train_rmse: {:0.8f}, test_rmse: {:0.8f}, '
+                  ).format((epoch + 1),
+                           epoches,
+                           min_test_loss,
+                           lr,
+                           train_loss[-1], test_loss[-1],
+                           np.sqrt(train_loss[-1]), np.sqrt(test_loss[-1]),
+                           )
+
+    print(str(datetime.datetime.now()))
+    print(log_string)
+    gc.collect()
+    torch.cuda.empty_cache()
+date_2 = datetime.datetime.now()
+print(best_result)
+
+print(date_2-date_1)
+
+
+from sklearn.metrics import mean_squared_error
+
+tradition_rmse = []
+tradition_mae = []
+tradition_mape = []
+tradition_r = []
+
+test_target_real = []
+for i in range(len(Data[0])):
+    tar_med = []
+    for j in range(len(Data)):
+        if i > 0:
+            tar_med.append(Data[j][i])
+    if i > 0:
+        test_target_real.append(tar_med[train_len:])
+
+pred = []
+for i in range(len(best_pred[0][0])):
+    pred_med = []
+    for j in range(len(best_pred)):
+        for k in range(len(best_pred[j])):
+            pred_med.append(best_pred[j][k][i].item())
+    pred.append(pred_med)
+
+for i in range(21):
+    mse = mean_squared_error(np.array(test_target_real[i])*scale, np.array(pred[i])*scale)
+    rmse = np.sqrt(mse)
+    mae  = np.mean(np.abs(np.array(test_target_real[i])*scale - np.array(pred[i])*scale))
+    map  = mape(np.array(test_target_real[i])*scale+min_data, np.array(pred[i])*scale+min_data)
+    r    = np.corrcoef(np.array(test_target_real[i])+min_data, np.array(pred[i]).T+min_data)[0, 1]
+
+    tradition_rmse.append(rmse)
+    tradition_mae.append(mae)
+    tradition_mape.append(map)
+    tradition_r.append(r)
+
+    print(rmse, mae, map, r)
+print('Statistical result:')
+print(np.mean(tradition_rmse), np.mean(tradition_mae), np.mean(tradition_mape), np.mean(tradition_r))
+
+
+print('-----------------------------RMSE----------------------------')
+for j in range(len(tradition_rmse)):
+    print(tradition_rmse[j])
+
+print('-----------------------------MAE------------------------------')
+for j in range(len(tradition_rmse)):
+    print(tradition_mae[j])
+
+print('-----------------------------MAPE-----------------------------')
+for j in range(len(tradition_rmse)):
+    print(tradition_mape[j])
+
+print('-----------------------------R-----------------------------')
+for j in range(len(tradition_rmse)):
+    print(tradition_r[j])
+
+
+def loss_trans_to_error(pre_tensor_all, tar):
+
+    pre_all = []
+    for m in range(len(pre_tensor_all)):
+        pre_all_med = []
+        for i in range(len(pre_tensor_all[m][0][0])):
+            pre_med = []
+            for j in range(len(pre_tensor_all[m])):
+                for k in range(len(pre_tensor_all[m][j])):
+                    pre_med.append(pre_tensor_all[m][j][k][i].item())
+            pre_all_med.append(pre_med)
+        pre_all.append(pre_all_med)
+
+    epoch_mae = []
+    epoch_rmse = []
+    epoch_mape = []
+    epoch_r = []
+    for m in range(len(pre_tensor_all)):
+        epoch_mae_med = []
+        epoch_rmse_med = []
+        epoch_mape_med = []
+        epoch_r_med = []
+        for i in range(21):
+            mse = mean_squared_error(np.array(tar[i]) * scale, np.array(pre_all[m][i]) * scale)
+            rmse = np.sqrt(mse)
+            mae = np.mean(np.abs(np.array(tar[i]) * scale - np.array(pre_all[m][i]) * scale))
+            map = mape(np.array(tar[i]) * scale + min_data, np.array(pre_all[m][i]) * scale + min_data)
+            r = np.corrcoef(np.array(tar[i]) + min_data, np.array(pre_all[m][i]).T + min_data)[0, 1]
+
+            epoch_rmse_med.append(rmse)
+            epoch_mae_med .append(mae)
+            epoch_mape_med.append(map)
+            epoch_r_med.append(r)
+
+        epoch_mae.append(np.mean(epoch_mae_med))
+        epoch_rmse.append(np.mean(epoch_rmse_med))
+        epoch_mape.append(np.mean(epoch_mape_med))
+        epoch_r.append(np.mean(epoch_r_med))
+
+    return epoch_mae, epoch_rmse, epoch_mape, epoch_r
+
+
+epoch_mae, epoch_rmse, epoch_mape, epoch_r = loss_trans_to_error(test_pred, test_target_real)
+
+
+print('-----------------------------EPOCH RMSE----------------------------')
+for i in range(len(epoch_rmse)):
+    print(epoch_rmse[i])
+
+print('-----------------------------EPOCH MAE------------------------------')
+for i in range(len(epoch_mae)):
+    print(epoch_mae[i])
+
+print('-----------------------------EPOCH MAPE-----------------------------')
+for i in range(len(epoch_mape)):
+    print(epoch_mape[i])
